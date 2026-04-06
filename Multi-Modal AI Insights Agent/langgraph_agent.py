@@ -1,3 +1,5 @@
+#已废弃，用langgraph_agent_stream.py替代
+
 import os
 from typing import Annotated
 from dotenv import load_dotenv
