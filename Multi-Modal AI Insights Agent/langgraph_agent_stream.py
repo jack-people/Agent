@@ -48,41 +48,33 @@ llm_synthesizer = ChatOpenAI(
 # ==========================================
     
 @tool
-
-#测试新引入了 Critic (审查节点) 和环路图，触发“失败-反思-重试”的死循环测试,直观地看到“Critic 反思与纠错”机制生效
 def search_local_arxiv_db(query: str) -> str:
-    """查询本地Arxiv论文库的工具"""
-    print("🤖【本地数据库】未找到完美匹配的论文，可能需要去互联网搜索更宽泛的关键词。")
-    return "【本地数据库】未找到完美匹配的论文，可能需要去互联网搜索更宽泛的关键词。"
+    """
+    当你需要查询 Arxiv 多模态论文的本地知识库时调用此工具。
+    输入：搜索关键词。返回：相关论文的标题和摘要。
+    """
 
-# 实际部署时，替换掉上面这个测试版本。
-# def search_local_arxiv_db(query: str) -> str:
-#     """
-#     当你需要查询 Arxiv 多模态论文的本地知识库时调用此工具。
-#     输入：搜索关键词。返回：相关论文的标题和摘要。
-#     """
-
-#      # 简化的检索逻辑
-#     import chromadb
-#     from chromadb.utils import embedding_functions
-#     try:
-#         client = chromadb.PersistentClient(path="./multimodal_papers_db")
-#         emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="BAAI/bge-small-zh-v1.5")
-#         collection = client.get_collection(name="arxiv_multimodal", embedding_function=emb_fn)
-#         # 注意这里 n_results 可以根据你的需要设置
-#         results = collection.query(query_texts=[query], n_results=9) 
+     # 简化的检索逻辑
+    import chromadb
+    from chromadb.utils import embedding_functions
+    try:
+        client = chromadb.PersistentClient(path="./multimodal_papers_db")
+        emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="BAAI/bge-small-zh-v1.5")
+        collection = client.get_collection(name="arxiv_multimodal", embedding_function=emb_fn)
+        # 注意这里 n_results 可以根据你的需要设置
+        results = collection.query(query_texts=[query], n_results=9) 
         
-#         if not results['ids'][0]:
-#             return "【本地数据库】未找到完美匹配的论文，可能需要去互联网搜索更宽泛的关键词。"
+        if not results['ids'][0]:
+            return "【本地数据库】未找到完美匹配的论文，可能需要去互联网搜索更宽泛的关键词。"
             
-#         res_str = "【本地 Arxiv 论文检索结果】\n"
-#         for i in range(len(results['ids'][0])):
-#             title = results['metadatas'][0][i]['title']
-#             abstract = results['documents'][0][i].split("Abstract: ")[-1][:300]
-#             res_str += f"- 标题: {title}\n  摘要: {abstract}...\n"
-#         return res_str
-#     except Exception as e:
-#         return f"本地检索出错: {str(e)}"
+        res_str = "【本地 Arxiv 论文检索结果】\n"
+        for i in range(len(results['ids'][0])):
+            title = results['metadatas'][0][i]['title']
+            abstract = results['documents'][0][i].split("Abstract: ")[-1][:300]
+            res_str += f"- 标题: {title}\n  摘要: {abstract}...\n"
+        return res_str
+    except Exception as e:
+        return f"本地检索出错: {str(e)}"
 
 @tool
 def search_web_news(query: str) -> str:
@@ -355,7 +347,7 @@ if __name__ == "__main__":
     
     print("================ 第一轮对话 (测试环形纠错) ================")
     # 我们故意提一个比较生僻或需要深挖的问题，观察 Critic 是否会打回
-    question_1 = "帮我查一下谷歌公司最新发布的关于gemma 4模型的细节，如果本地没有请去网上搜。"
+    question_1 = "帮我查一下谷歌公司最新发布的关于gemma 4模型的细节，尤其是关于在端侧怎么支持多模态的，如果本地没有请去网上搜。"
     print(f"🧑‍💻 用户提问: {question_1}\n")
     
     for output in app.stream({"messages":[HumanMessage(content=question_1)]}, config=config, stream_mode="updates"):
