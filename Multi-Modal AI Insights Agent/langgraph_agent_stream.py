@@ -1,13 +1,24 @@
 import os
+import uuid
+import chromadb
 from typing import Annotated
 from dotenv import load_dotenv
+from datetime import datetime
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
+#from FlagEmbedding import FlagReranker
+from sentence_transformers import CrossEncoder
+from chromadb.utils import embedding_functions
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import MemorySaver  # 👈 引入记忆组件
+# 注意：MemorySaver 是 LangGraph 内置的一个简单的内存保存器，适合本地测试和小规模使用。
+#from langgraph.checkpoint.memory import MemorySaver  
+import sqlite3
+# from langgraph.checkpoint.sqlite import SqliteSaver
+# MemorySaver替换为 SqliteSaver，适合更大规模的持久化存储，并且支持查询和分析历史对话数据。
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -43,6 +54,12 @@ llm_synthesizer = ChatOpenAI(
     max_tokens=4096
 )
 
+# 加载 Re-ranker 模型（放在文件顶部，避免每次查询都加载）
+# FlagReranker和transformers版本冲突改为CrossEncoder
+# reranker = FlagReranker('BAAI/bge-reranker-base', use_fp16=True) 
+reranker = CrossEncoder('BAAI/bge-reranker-base', max_length=512)
+print("加载完成 Reranker 模型 (BAAI/bge-reranker-base)...")
+
 # ==========================================
 # 1. 定义 Agent 的工具 (Tools)
 # ==========================================
@@ -55,23 +72,45 @@ def search_local_arxiv_db(query: str) -> str:
     """
 
      # 简化的检索逻辑
-    import chromadb
-    from chromadb.utils import embedding_functions
     try:
         client = chromadb.PersistentClient(path="./multimodal_papers_db")
         emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="BAAI/bge-small-zh-v1.5")
         collection = client.get_collection(name="arxiv_multimodal", embedding_function=emb_fn)
-        # 注意这里 n_results 可以根据你的需要设置
-        results = collection.query(query_texts=[query], n_results=9) 
-        
-        if not results['ids'][0]:
-            return "【本地数据库】未找到完美匹配的论文，可能需要去互联网搜索更宽泛的关键词。"
+
+        # 👉 阶段 1：粗排召回 (Recall Top 20)
+        total_docs = collection.count()
+        print("【本地数据库】当前文档总数:", total_docs)
+        if total_docs == 0:
+            return "【本地数据库】当前为空，请先入库数据。"
             
+        recall_k = min(20, total_docs) 
+        results = collection.query(query_texts=[query], n_results=recall_k)
+        if not results['ids'][0]:
+            return "【本地数据库】未找到相关论文。"
+
+        # 准备数据对交给重排器
+        docs = results['documents'][0]
+        metadatas = results['metadatas'][0]
+        sentence_pairs = [[query, doc] for doc in docs]
+        
+        # 👉 阶段 2：精排打分 (Rerank)
+        scores = reranker.compute_score(sentence_pairs)
+        
+        # 将文档、元数据和得分组合在一起并排序
+        scored_docs = list(zip(docs, metadatas, scores))
+        # 按照 score 降序排列
+        scored_docs.sort(key=lambda x: x[2], reverse=True)
+        
+        # 👉 阶段 3：截断 (Top 3)
+        top_3_docs = scored_docs[:3]    
+        
         res_str = "【本地 Arxiv 论文检索结果】\n"
-        for i in range(len(results['ids'][0])):
-            title = results['metadatas'][0][i]['title']
-            abstract = results['documents'][0][i].split("Abstract: ")[-1][:300]
-            res_str += f"- 标题: {title}\n  摘要: {abstract}...\n"
+        for doc, meta, score in top_3_docs:
+            # 加上你原来的清洗逻辑，提取真正的摘要内容
+            clean_abstract = doc.split("Abstract: ")[-1][:300] 
+            
+            res_str += f"-[相关度得分: {score:.2f}] 标题: {meta['title']}\n  摘要: {clean_abstract}...\n"
+        
         return res_str
     except Exception as e:
         return f"本地检索出错: {str(e)}"
@@ -213,29 +252,44 @@ def synthesizer_node(state: AgentState):
 def critic_node(state: AgentState):
     print("\n🕵️ [Critic] 正在严格审查 Synthesizer 生成的答案...")
     
-    # 获取用户的最初问题和模型生成的答案
-    #original_question = state["messages"][0].content
     # ✅ 同样需要动态获取最新提问，以便审查最新回答是否切题
     latest_question = get_latest_question(state["messages"])
     last_answer = state["messages"][-1].content
     
+    # ✅ 新增：让 Critic 也能看到工具搜到了什么，防止它凭借老旧的内部知识瞎判！
+    context_str = ""
+    for msg in state["messages"]:
+        if getattr(msg, "type", "") == "tool":
+            context_str += f"\n[工具检索资料]: {msg.content}"
+            
+    if not context_str.strip():
+        context_str = "暂无外部参考资料。"
+
+    # 获取当前真实时间，校准大模型的时间钟
+    current_date = datetime.now().strftime("%Y年%m月%d日")
+    print
     # 1. 初始化 Pydantic 解析器
     parser = PydanticOutputParser(pydantic_object=CriticOutput)
     
     # 2. 将解析器的格式要求注入到提示词中
     prompt = f"""你是一个极其苛刻的AI内容审查专家。
-    请评估以下生成的答案是否完美解答了用户【最新】的提问。
-    【核心审查标准】：
-    1. 🎯 主体精准对齐（最重要）：答案必须与用户询问的具体实体、版本号或事件完全一致！
-    如果用户问的是“最新版本（如某产品的第4代）”，但答案却用“旧版本（如第2代或第3代）”的信息来敷衍，
-    说明它没有搜到最新信息，必须打回（0分），让Router重新更换关键词搜索！
-    2. 💡 实质性解答：答案是否给出了用户想要的细节？如果回答“未查到相关信息”、
-    “目前没有任何关于XX的报道”、 “作为一个AI模型无法获取最新信息”，视为没有解决问题，必须打回重做（0分）。
-    3. ⏳ 宽容的时间/来源声明：只要答案中包含了实质性的新知识（确实准确回答了用户询问的主体），
-    允许模型在句首或句尾说明“根据网络搜索结果”或“截至XXXX年X月的报道”。这是严谨的表现，
-    绝对【不要】将其误判为AI的推脱之词。
+当前系统时间是：{current_date}。
+请评估以下生成的答案是否完美解答了用户【最新】的提问。
+
+【核心审查标准】：
+1. 🎯 主体精准对齐（最重要）：答案必须与用户询问的具体实体、版本号或事件完全一致！
+如果用户问的是“最新版本（如某产品的第4代）”，但答案却用“旧版本（如第2代或第3代）”的信息来敷衍，
+说明它没有搜到最新信息，必须打回（0分），让Router重新更换关键词搜索！
+并且请【务必】对比下方的[参考资料]来判断是否产生幻觉！只要答案的内容在[参考资料]中有提及，就视为正确。
+绝不能因为超出了你的内部陈旧知识，或者出现了未来的年份，就误判为虚构！
+2. 💡 实质性解答：答案是否给出了用户想要的细节？如果回答“未查到相关信息”、
+“目前没有任何关于XX的报道”、 “作为一个AI模型无法获取最新信息”，视为没有解决问题，必须打回重做（0分）。
+3. ⏳ 宽容的时间/来源声明：只要答案中包含了实质性的新知识（确实准确回答了用户询问的主体），
+允许模型在句首或句尾说明“根据网络搜索结果”或“截至XXXX年X月的报道”。这是严谨的表现，
+绝对【不要】将其误判为AI的推脱之词。
 
 用户最新提问: {latest_question}
+工具收集到的参考资料: {context_str}
 最新生成的答案: {last_answer}
 
 【重要指令】
@@ -282,7 +336,6 @@ def critic_node(state: AgentState):
     else:
         print("   -> ✅ 审查通过，准备输出给用户。")
         return {"critic_decision": "ACCEPT"}
-    
 
 # 判断 Critic 的决定
 def critic_condition(state: AgentState) -> str:
@@ -314,51 +367,82 @@ workflow.add_conditional_edges(
     {"ACCEPT": END, "REJECT": "router"}
 )
 
-# 👈 核心改进：引入 MemorySaver 编译图
-memory = MemorySaver()  # 重新初始化清楚占用，MemorySaver是直接存储在本地存储并且不会自动删除
+# 👈 引入 MemorySaver 编译图
+#memory = MemorySaver()  # 重新初始化清楚占用，MemorySaver是直接存储在本地存储并且不会自动删除
+
+# 👈 核心改进：引入 SqliteSaver 实现真正的持久化记忆
+# 连接到一个本地 SQLite 数据库文件（如果没有，它会自动创建）
+db_path = "databank/agent_chat_history.db"
+conn = sqlite3.connect(db_path, check_same_thread=False)
+
+# 使用 SqliteSaver
+memory = SqliteSaver(conn)
+
+
 # 编译图，引入checkpointer 参数激活了 LangGraph 的长期记忆功能
 app = workflow.compile(checkpointer=memory) 
 
 
-# ==========================================
-# 5. 运行 Agent 测试
-# ==========================================
-# if __name__ == "__main__":
-#     question = "多模态大模型(VLM)最近有什么突破性的最新进展？如果本地论文不够新，请去网上找最新的报道。"
-#     print(f"🧑‍💻 用户提问: {question}\n" + "-"*50)
+if __name__ == "__main__":
+    print("==================================================")
+    print("🤖 欢迎使用多模态智能体 Agent！(输入 'exit' 或 'quit' 退出)")
+    print("==================================================")
     
-#     # 运行流式输出，观察 Agent 的每一步
-#     for output in app.stream({"messages": [HumanMessage(content=question)]}, stream_mode="updates"):
-#         for node_name, node_state in output.items():
-#             if node_name == "router":
-#                 msg = node_state["messages"][0]
-#                 if msg.tool_calls:
-#                     print(f"   -> 决定调用工具: {[t['name'] for t in msg.tool_calls]}")
-#             elif node_name == "tools":
-#                 print("   -> 工具执行完毕，获取到参考资料。")
+    # 1. 初始化会话 ID。你可以自己定义，或者让用户输入
+    session_id = input("请输入您的会话名称 (直接回车则默认使用 'default-session'): ")
+    if not session_id.strip():
+        session_id = "default-session"
+        
+    config = {"configurable": {"thread_id": session_id}}
+    print(f"✅ 已连接到会话: {session_id} (具备历史记忆)\n")
+
+    # 2. 开启无限循环的聊天窗口
+    while True:
+        # 获取用户动态输入
+        user_input = input("\n🧑‍💻 用户提问: ")
+        
+        # 如果用户输入 exit 或 quit，则退出程序
+        if user_input.lower() in ['exit', 'quit']:
+            print("👋 感谢使用，再见！")
+            break
+            
+        # 防止用户直接按回车发送空消息
+        if not user_input.strip():
+            continue
+            
+        # 3. 将用户的输入送入 Agent 图中处理
+        try:
+            for output in app.stream({"messages":[HumanMessage(content=user_input)]}, config=config, stream_mode="updates"):
+                # 因为在各个 Node (节点) 函数内部我们已经写了 print 逻辑（包括灰色思考过程等），
+                # 所以这里用 pass 即可，控制台会自动打出完整的思考和回复流。
+                pass 
+                
+        except Exception as e:
+            print(f"\n❌ 运行时发生错误: {e}")
+            print("系统已恢复，您可以继续提问。")
 
 
 # ==========================================
 # 6. 运行 Agent (多轮对话测试)
 # ==========================================
-if __name__ == "__main__":
-    # 配置会话信息：同一个 thread_id 代表同一个聊天会话，这样模型就有了"记忆"
-    config = {"configurable": {"thread_id": "session-deepseek-1"}}
+# if __name__ == "__main__":
+#     # 配置会话信息：同一个 thread_id 代表同一个聊天会话，这样模型就有了"记忆"
+#     config = {"configurable": {"thread_id": "session-deepseek-1"}}
     
-    print("================ 第一轮对话 (测试环形纠错) ================")
-    # 我们故意提一个比较生僻或需要深挖的问题，观察 Critic 是否会打回
-    question_1 = "帮我查一下谷歌公司最新发布的关于gemma 4模型的细节，尤其是关于在端侧怎么支持多模态的，如果本地没有请去网上搜。"
-    print(f"🧑‍💻 用户提问: {question_1}\n")
+#     print("================ 第一轮对话 (测试环形纠错) ================")
+#     # 我们故意提一个比较生僻或需要深挖的问题，观察 Critic 是否会打回
+#     question_1 = "帮我查一下谷歌公司最新发布的关于gemma 4模型的细节，尤其是关于在端侧怎么支持多模态的，如果本地没有请去网上搜。"
+#     print(f"🧑‍💻 用户提问: {question_1}\n")
     
-    for output in app.stream({"messages":[HumanMessage(content=question_1)]}, config=config, stream_mode="updates"):
-        pass # stream 中的具体打印已经在 Node 内部处理了
+#     for output in app.stream({"messages":[HumanMessage(content=question_1)]}, config=config, stream_mode="updates"):
+#         pass # stream 中的具体打印已经在 Node 内部处理了
 
     
-    print("\n\n================ 第二轮对话 (测试长期记忆) ================")
-    # 这一轮我们不提"MM1"，也不提"多模态"，看看 Agent 是否记得第一轮的内容
-    question_2 = "根据你刚才找到的内容，它的参数量最大是多少？有哪些创新点？"
-    print(f"🧑‍💻 用户追问: {question_2}\n")
+#     print("\n\n================ 第二轮对话 (测试长期记忆) ================")
+#     # 这一轮我们不提"MM1"，也不提"多模态"，看看 Agent 是否记得第一轮的内容
+#     question_2 = "根据你刚才找到的内容，它的参数量最大是多少？有哪些创新点？"
+#     print(f"🧑‍💻 用户追问: {question_2}\n")
     
-    for output in app.stream({"messages": [HumanMessage(content=question_2)]}, config=config, stream_mode="updates"):
-        pass
+#     for output in app.stream({"messages": [HumanMessage(content=question_2)]}, config=config, stream_mode="updates"):
+#         pass
             
