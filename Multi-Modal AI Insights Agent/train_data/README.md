@@ -1,1 +1,2 @@
-
+data.py:用deekseek根据本地从arxiv上爬取的论文生成模型训练数据。
+tech_guru_data.json:上面的运行结果
