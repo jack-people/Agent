@@ -61,3 +61,26 @@ langgraph_agent_local_stream.py:在上面的文件的基础上，增加了本地
 2 引入 SqliteSaver替代MemorySaver存储对话记录,实现ChatBot
 
 3 更新各节点里prompt，规范输出
+
+
+第四版
+
+引入Docker 容器本地部署Dify社区版，建立企业版知识库
+记录该版本开发遇到的问题和思路：
+
+1 知识库还是通过paper_markdown_get.py从arxiv里爬取最新的多模态论文；
+
+  1.1 由于arxiv网站下载太慢，用vpn又会提示类似的(❌ 请求 arXiv API 失败: <urlopen error [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+      或'Connection aborted.', ConnectionResetError(10054, '远程主机强迫关闭了一个现有的连接。', None, 10054, None))
+      的错误，这里加入重试机制和把urllib.request.urlopen 彻底删掉，换成requests（这个没用！！！）。4月份网络代理有点崩这部分先这样
+  
+  1.2 step2_process_pdfs_local函数有问题未解决，先在MinerU官网用在线版本，每天额度5000够用
+
+2 embed_server.py和rerank_server.py提供embedding（bge-m3），rerank（bge-reranker-v2-m3）模型本地服务
+  注意：在dify里更新知识库时。需要先启动embed_server.py，rerank_server.py和docker容器（docker compose up -d）来正常服务
+
+3 dify社区版知识库不能直接被本地环境（vscode）里调用（注意：这里测试不行但是没查官方文档不确定），
+  需要在dify新建应用（workflow）并且绑定URL和API，具体见config.py。
+  还有要改dify_main\docker\docker-compose.yaml文件里api: 下新加ports:  - "5001:5001"  # 将容器的5001端口映射到宿主机的5001，不然会报404
+  
+4 知识库分段用的是父子文档模式，混合检索加重排序提高准确率
